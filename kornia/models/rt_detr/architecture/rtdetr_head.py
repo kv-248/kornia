@@ -326,7 +326,9 @@ class RTDETRHead(nn.Module):
     """Implement the RT-DETR prediction head for object detection.
 
     ``eval_idx`` selects the decoder layer whose predictions the head returns; a negative value counts back from the
-    last layer (``-1``), and the layers after the selected one do not run.
+    last layer (``-1``), and the layers after the selected one do not run. ``num_levels`` is the number of feature
+    levels the decoder attends over. It must be at least the number of maps in ``in_channels``; each extra level is a
+    stride-2 downsample of the last map, as in the reference ``RTDETRTransformer._build_input_proj_layer``.
     """
 
     def __init__(
@@ -346,17 +348,29 @@ class RTDETRHead(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.num_queries = num_queries
-        # TODO: verify this is correct
+        # One backbone map per level. Fewer maps than levels is valid: the missing levels are built below.
+        # More maps than levels is not: the decoder's ``num_levels`` would not match the concatenated memory.
         if len(in_channels) > num_levels:
-            raise ValueError(f"`num_levels` cannot be greater than {len(in_channels)}. Got {num_levels}.")
+            raise ValueError(
+                f"`in_channels` has {len(in_channels)} feature maps but `num_levels` is {num_levels}. "
+                "Each map is one level, so `num_levels` must be at least the number of maps."
+            )
+        if num_levels > len(in_channels) and not in_channels:
+            raise ValueError("`num_levels` greater than zero needs at least one feature map to downsample.")
         self.num_levels = num_levels
 
-        # build the input projection layers
+        # 1x1 projections of the backbone maps, then one stride-2 3x3 projection per extra level.
+        # The first extra level reads the last backbone map; each later one reads the previous projection
+        # (``hidden_dim`` channels). ``_get_encoder_input`` applies them in that order.
+        # https://github.com/lyuwenyu/RT-DETR/blob/main/rtdetr_pytorch/src/zoo/rtdetr/rtdetr_decoder.py
         self.input_proj = nn.ModuleList()
         for ch_in in in_channels:
             self.input_proj.append(ConvNormAct(ch_in, hidden_dim, 1, act="none"))
-        # NOTE: might be missing some layers here ?
-        # https://github.com/lyuwenyu/RT-DETR/blob/main/rtdetr_pytorch/src/zoo/rtdetr/rtdetr_decoder.py#L403-L410
+        if num_levels > len(in_channels):
+            extra_in_channels = in_channels[-1]
+            for _ in range(num_levels - len(in_channels)):
+                self.input_proj.append(ConvNormAct(extra_in_channels, hidden_dim, 3, stride=2, act="none"))
+                extra_in_channels = hidden_dim
 
         # NOTE: need to be integrated with the TransformerDecoderLayer
         decoder_layer = TransformerDecoderLayer(

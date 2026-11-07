@@ -201,6 +201,51 @@ class TestRTDETR(BaseTester):
             with pytest.raises(BaseError, match="eval_idx"):
                 RTDETRHead(5, 32, 10, in_channels, 3, eval_idx=out_of_range)
 
+    def test_extra_levels_downsample_the_last_feature_map(self, device):
+        # num_levels above len(in_channels) used to build only the 1x1 projections and then raise
+        # IndexError in _get_encoder_input, which indexes input_proj for the missing levels.
+        in_channels = [16, 32]
+        head = (
+            RTDETRHead(4, 16, 4, in_channels, num_decoder_layers=1, num_levels=4, num_denoising=0, num_heads=4)
+            .to(device)
+            .eval()
+        )
+        assert len(head.input_proj) == 4
+        assert head.input_proj[0].conv.kernel_size == (1, 1)
+        assert head.input_proj[1].conv.kernel_size == (1, 1)
+        # The first extra level reads the last backbone map; later ones read the previous projection.
+        assert head.input_proj[2].conv.kernel_size == (3, 3)
+        assert head.input_proj[2].conv.stride == (2, 2)
+        assert head.input_proj[2].conv.in_channels == 32
+        assert head.input_proj[3].conv.in_channels == 16
+
+        generator = torch.Generator().manual_seed(0)
+        fmaps = [
+            torch.rand(1, 16, 8, 10, generator=generator),
+            torch.rand(1, 32, 4, 5, generator=generator),
+        ]
+        fmaps = [fmap.to(device) for fmap in fmaps]
+        _, spatial_shapes, level_start = head._get_encoder_input(fmaps)
+        # stride-2, kernel 3, padding 1: (4, 5) -> (2, 3) -> (1, 2)
+        assert spatial_shapes == [(8, 10), (4, 5), (2, 3), (1, 2)]
+        assert level_start == [0, 80, 100, 106]
+
+        logits, boxes = head(fmaps)
+        assert logits.shape == (1, 4, 4)
+        assert boxes.shape == (1, 4, 4)
+        assert torch.isfinite(logits).all()
+        assert torch.isfinite(boxes).all()
+
+        # An equal count keeps one 1x1 projection per map and no stride-2 layer.
+        matched = RTDETRHead(4, 16, 4, in_channels, 1, num_levels=2, num_denoising=0, num_heads=4)
+        assert len(matched.input_proj) == 2
+        assert all(proj.conv.kernel_size == (1, 1) for proj in matched.input_proj)
+
+    def test_more_feature_maps_than_levels_names_the_counts(self):
+        # The check used to say num_levels cannot be greater than the map count while rejecting the opposite case.
+        with pytest.raises(ValueError, match=r"in_channels.*3 feature maps.*num_levels.*2"):
+            RTDETRHead(4, 16, 4, [16, 32, 64], 1, num_levels=2, num_denoising=0, num_heads=4)
+
     @pytest.mark.device_agnostic
     def test_from_pretrained_mode(self, monkeypatch):
         monkeypatch.setattr(
