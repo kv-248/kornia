@@ -132,6 +132,10 @@ def spatial_expectation2d(input: torch.Tensor, normalized_coordinates: bool = Tr
         - Coordinates follow :ref:`Coordinates and sizes <coordinate-conventions>`. The input is used as given, not
           renormalized, so each map should sum to one, as the output of
           :func:`~kornia.geometry.subpix.spatial_softmax2d` does: a map summing to ``s`` scales the result by ``s``.
+        - A float16 or bfloat16 map is weighted in float32 and the coordinate is rounded to the map's dtype once.
+          Summing the products in half precision is not that rounding: masses ``0.1``, ``0.2``, ``0.3`` and ``0.4``
+          at pixels ``(1, 0)``, ``(2, 0)``, ``(3, 1)`` and ``(7, 3)`` come out at ``x = 4.1875`` in bfloat16 and
+          ``y = 1.4990234375`` in float16, where the float32 sum rounds to ``4.21875`` and ``1.5``.
 
     Args:
         input: the input torch.Tensor representing dense spatial probabilities with shape ``(B, N, H, W)``.
@@ -161,24 +165,29 @@ def spatial_expectation2d(input: torch.Tensor, normalized_coordinates: bool = Tr
 
     batch_size, channels, height, width = input.shape
 
-    # Create coordinates grid in the input dtype, so float64 coordinates carry no float32 rounding. float16 and
-    # bfloat16 still build it in float32 and round once in the cast below, which keeps their results unchanged.
-    grid_dtype = torch.float32 if input.dtype in (torch.float16, torch.bfloat16) else input.dtype
+    # Float64 keeps its own grid, so a spacing such as 1/3 is not rounded to float32 first. Half precision weighs that
+    # float32 grid and rounds the coordinate once: a bfloat16 coordinate is exact only up to 256, and the sum of one
+    # product per pixel in half precision is not the half-precision rounding of the float32 sum.
+    output_dtype = input.dtype
+    half = output_dtype in (torch.float16, torch.bfloat16)
+    grid_dtype = torch.float32 if half else output_dtype
     grid = create_meshgrid(height, width, normalized_coordinates, input.device, grid_dtype)
-    grid = grid.to(input.dtype)
+    if not half:
+        grid = grid.to(output_dtype)
 
     pos_x = grid[..., 0].reshape(-1)
     pos_y = grid[..., 1].reshape(-1)
 
     input_flat = input.reshape(batch_size, channels, height * width)
+    if half:
+        input_flat = input_flat.float()
 
     # Compute the expectation of the coordinates.
     expected_y = torch.sum(pos_y * input_flat, -1, keepdim=True)
     expected_x = torch.sum(pos_x * input_flat, -1, keepdim=True)
 
-    output = torch.cat([expected_x, expected_y], -1)
-
-    return output.view(batch_size, channels, 2)  # BxNx2
+    output = torch.cat([expected_x, expected_y], -1).view(batch_size, channels, 2)
+    return output.to(output_dtype) if half else output
 
 
 def render_gaussian2d(

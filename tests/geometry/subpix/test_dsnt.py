@@ -352,13 +352,40 @@ class TestSpatialExpectation2d(BaseTester):
         self.assert_close(kornia.geometry.subpix.spatial_expectation2d(probs, True), reference, rtol=0.0, atol=1e-14)
 
     def test_bfloat16_grid_rounds_once_5019(self, device):
-        # bfloat16 keeps building the grid in float32 and rounds each coordinate once. Built directly in bfloat16,
-        # the pixel coordinate 2057 comes out as 2048 instead of its nearest bfloat16 value 2064.
+        # The expectation is accumulated in float32 and the coordinate is rounded once. A grid built in bfloat16
+        # would store pixel 2057 as 2048; the float32 coordinate 2057 rounds to 2064 on the way out.
         heatmap = torch.zeros(1, 1, 1, 3001, device=device, dtype=torch.bfloat16)
         heatmap[0, 0, 0, 2057] = 1.0
         out = kornia.geometry.subpix.spatial_expectation2d(heatmap, False)
         expected = torch.tensor([[[2064.0, 0.0]]], device=device, dtype=torch.bfloat16)
         self.assert_close(out, expected, rtol=0.0, atol=0.0)
+
+    @pytest.mark.parametrize(
+        ("dtype", "expected_xy"),
+        [
+            (torch.bfloat16, (4.21875, 1.5)),
+            (torch.float16, (4.19921875, 1.5)),
+        ],
+    )
+    def test_half_precision_expectation_is_the_float32_sum(self, device, dtype, expected_xy):
+        # Masses 0.1, 0.2, 0.3, 0.4 stored in the map's dtype, at pixels (x, y) = (1, 0), (2, 0), (3, 1), (7, 3).
+        # The float32 sum of those stored values times the integer coordinates is (4.20556640625, 1.501953125) in
+        # bfloat16 and (4.1993408203125, 1.499755859375) in float16; rounding that sum is the pair below. Summing the
+        # products in half precision instead returned (4.1875, 1.5) and (4.19921875, 1.4990234375).
+        probs = torch.zeros(1, 1, 4, 8, device=device, dtype=dtype)
+        probs[0, 0, 0, 1] = 0.1
+        probs[0, 0, 0, 2] = 0.2
+        probs[0, 0, 1, 3] = 0.3
+        probs[0, 0, 3, 7] = 0.4
+        expected = torch.tensor([[list(expected_xy)]], device=device, dtype=dtype)
+
+        actual = kornia.geometry.subpix.spatial_expectation2d(probs, normalized_coordinates=False)
+
+        self.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        probs = probs.detach().requires_grad_()
+        kornia.geometry.subpix.spatial_expectation2d(probs, normalized_coordinates=False).sum().backward()
+        assert probs.grad is not None
+        assert torch.isfinite(probs.grad).all()
 
     @pytest.mark.skip("After the op be optimized the results are not the same")
     def test_dynamo(self, dtype, device, torch_optimizer):
