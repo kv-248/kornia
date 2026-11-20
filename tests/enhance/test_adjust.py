@@ -1395,6 +1395,26 @@ class TestEqualize(BaseTester):
         expected[..., :100, :] = 0.0
         self.assert_close(kornia.enhance.equalize(inputs), expected, rtol=0.0, atol=0.0)
 
+    @pytest.mark.applies_to(devices=("cpu",), reason="large CPU histogram regression")
+    def test_bin_past_float32_exact_range_keeps_integer_level(self, device):
+        # A 19-megapixel plane in [0, 1]. Counts at levels 0, 40 and 200 are (2**24 + 2**20, 2**20, 1).
+        # PIL's integer table maps level 40 to 241:
+        #   step = (18874369 - 1) // 255 = 74017
+        #   (37008 + 17825792) // 74017 = 241
+        # A float32 scatter of unit counts freezes level 0 at 2**24 and maps level 40 to 240.
+        dark = 2**24 + 2**20
+        mid = 2**20
+        image = torch.empty(1, 1, 1, dark + mid + 1, device=device, dtype=torch.float32)
+        image[..., :dark] = 0
+        image[..., dark : dark + mid] = 40 / 255
+        image[..., -1] = 200 / 255
+
+        out = kornia.enhance.equalize(image).view(-1)
+        level = torch.tensor(241.0, device=device, dtype=out.dtype) / 255
+        self.assert_close(out[dark : dark + mid], level.expand(mid), rtol=0, atol=0)
+        self.assert_close(out[:dark], torch.zeros(dark, device=device, dtype=out.dtype), rtol=0, atol=0)
+        self.assert_close(out[-1], torch.ones((), device=device, dtype=out.dtype), rtol=0, atol=0)
+
     def test_gradcheck(self, device):
         bs, channels, height, width = 1, 2, 3, 3
         inputs = torch.ones(bs, channels, height, width, device=device, dtype=torch.float64)

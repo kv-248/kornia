@@ -1,0 +1,1 @@
+`equalize` and `equalize3d` now accumulate histogram counts in int64, so a float32 channel with more than `2**24` pixels in one 8-bit level keeps the lookup table integer division builds. Those counts used to stop at `2**24` and shift later levels by one.

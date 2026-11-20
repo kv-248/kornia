@@ -39,7 +39,6 @@ from kornia.core.utils import (
     _clamp_unit_range,
     _is_tracing_or_exporting,
     _needs_derivatives,
-    _normalize_to_float32_or_float64,
     _to_device_nonblocking,
     is_compiling,
 )
@@ -1253,8 +1252,8 @@ def _scale_channel_batched(input: torch.Tensor) -> torch.Tensor:
     Computes all per-plane histograms/LUTs in a single batched pass instead of a Python loop of
     ``B * C`` serial calls. Each pixel is counted in the LUT entry it reads, its 8-bit level
     ``(x * _level_scale(x.dtype)).long()`` computed in the input dtype, so a plane whose LUT step is not 0 comes
-    out as ``PIL.ImageOps.equalize`` of those levels while the counts and their running sums are exact (a plane
-    of up to ``2**24`` pixels in float32); a plane whose step is 0 is returned as it is.
+    out as ``PIL.ImageOps.equalize`` of those levels. Counts and the running sum are accumulated in int64, so a
+    plane larger than ``2**24`` pixels keeps every count; a plane whose step is 0 is returned as it is.
 
     Args:
         input: image tensor shaped ``(B, C, *spatial)`` with values in ``[0, 1]``.
@@ -1283,16 +1282,16 @@ def _scale_channel_batched(input: torch.Tensor) -> torch.Tensor:
         guard=True,
     )
 
-    # Count in float32 (float64 stays float64): a count grows with the plane size, which half precision
-    # cannot hold. float16 rounds counts above 2048 and their total overflows to inf past 65504, and
-    # bfloat16 rounds counts above 256.
-    count_dtype = _normalize_to_float32_or_float64(flat.dtype)
+    # Count in int64. Half precision cannot hold a plane's counts, and a float32 scatter of unit ones stops
+    # at 2**24: one more pixel in that bin is dropped, which moves later lookup entries by a level. The table
+    # below is the integer division PIL uses, so it stays in int64 until the finished entries are cast back.
+    # One expanded unit avoids a per-pixel ones buffer.
     # Per-plane 256-bin histogram on the index the lookup below reads, so every pixel is counted in its own
     # entry, as PIL counts and reads one 8-bit level. ``torch.histc(x, 256, 0, 255)`` bins in ``floor(256 x)``,
     # which puts every value in ``[k/256, k/255)``, about half of a continuous image, one bin above that entry.
     index = levels.long()
-    histo = torch.zeros(n, 256, device=input.device, dtype=count_dtype)
-    histo.scatter_add_(1, index, torch.ones_like(levels, dtype=count_dtype))
+    histo = torch.zeros(n, 256, device=input.device, dtype=torch.int64)
+    histo.scatter_add_(1, index, index.new_ones(1).expand_as(index))
 
     # step = (sum(nonzero) - last_nonzero) // 255, per plane.
     total = histo.sum(1)
@@ -1332,8 +1331,8 @@ def equalize(input: torch.Tensor) -> torch.Tensor:
           A continuous value moves up a level only within that margin below a level boundary.
         - The lookup step is the pixel count minus the count at the highest occupied level, integer-divided by 255. A
           channel whose step is 0, which includes every channel of up to 255 pixels, is returned unchanged.
-        - A float32 image counts in float32, which is exact while a channel holds at most ``2**24`` pixels (a 4096 by
-          4096 image).
+        - Histogram counts and that integer table are accumulated in int64, so a channel keeps every count, including
+          one with more than ``2**24`` pixels.
         - Empty leading dimensions are supported; channels and spatial dimensions must be non-empty.
 
     Args:
@@ -1375,8 +1374,8 @@ def equalize3d(input: torch.Tensor) -> torch.Tensor:
 
     Convention:
         - Each voxel is read at its 8-bit level as :func:`equalize` reads a pixel.
-        - The lookup step and the unchanged-channel rule are those of :func:`equalize`, counted over the voxels of a
-          channel volume.
+        - The lookup step and the unchanged-channel rule are those of :func:`equalize`, counted in int64 over the
+          voxels of a channel volume, including a channel with more than ``2**24`` voxels.
         - Empty leading dimensions are supported; channels and spatial dimensions must be non-empty.
 
     Args:
